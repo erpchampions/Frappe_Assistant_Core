@@ -89,17 +89,24 @@ class ChatGPTFetch(BaseTool):
 
             doctype, name = doc_id.split("/", 1)
 
+            from frappe_assistant_core.core.security_config import (
+                filter_sensitive_fields,
+                validate_document_access,
+            )
+
+            validation_result = validate_document_access(
+                user=frappe.session.user, doctype=doctype, name=name, perm_type="read"
+            )
+            if not validation_result["success"]:
+                raise frappe.PermissionError(validation_result.get("error", "Permission denied"))
+
+            user_role = validation_result["role"]
+
             # Get document using existing functionality
             doc = frappe.get_doc(doctype, name)
 
-            # Check permissions
-            if not doc.has_permission("read"):
-                raise frappe.PermissionError(f"No read permission for {doctype} {name}")
-
-            # Filter sensitive fields
-            from frappe_assistant_core.core.security_config import filter_sensitive_fields
-
-            doc_dict = filter_sensitive_fields(doc.as_dict(), doctype)
+            # Filter sensitive fields based on user role
+            doc_dict = filter_sensitive_fields(doc.as_dict(), doctype, user_role)
 
             # Create title from name field or document name
             title = doc_dict.get("title") or doc_dict.get("name") or name
