@@ -87,7 +87,11 @@ def timeout_limit(seconds: int = DEFAULT_TIMEOUT_SECONDS):
         return
 
     # Store old handler
-    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    try:
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    except ValueError:
+        yield
+        return
     signal.alarm(seconds)
 
     try:
@@ -185,26 +189,25 @@ def cpu_time_limit(max_cpu_seconds: int = DEFAULT_MAX_CPU_TIME_SECONDS):
         yield
         return
 
+    # Try to set CPU limits before yielding — single yield avoids
+    # "generator didn't stop after throw()" in non-main threads.
+    soft = hard = None
     try:
         import resource
-
-        # Get current limits
         soft, hard = resource.getrlimit(resource.RLIMIT_CPU)
-
-        # Set new limits
         new_soft = min(max_cpu_seconds, hard) if hard != resource.RLIM_INFINITY else max_cpu_seconds
-
         resource.setrlimit(resource.RLIMIT_CPU, (new_soft, hard))
-
-        try:
-            yield
-        finally:
-            # Restore original limits
-            resource.setrlimit(resource.RLIMIT_CPU, (soft, hard))
-
     except (ImportError, ValueError, OSError) as e:
         frappe.logger("execution_limits").warning(f"Could not set CPU time limits: {e}")
+
+    try:
         yield
+    finally:
+        if soft is not None and hard is not None:
+            try:
+                resource.setrlimit(resource.RLIMIT_CPU, (soft, hard))
+            except Exception:
+                pass
 
 
 @contextmanager
