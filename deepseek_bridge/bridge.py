@@ -873,6 +873,16 @@ class LocalTools:
                 "required": [],
             },
         },
+        {
+            "name": "list_bridge_sessions",
+            "description": "List saved bridge conversation sessions. Use this when the user asks about "
+            "sessions, saved conversations, or bridge history. Returns session names, message counts, and timestamps.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
     ]
 
     @staticmethod
@@ -886,6 +896,8 @@ class LocalTools:
             return LocalTools._write_file(arguments)
         elif tool_name == "list_local_files":
             return LocalTools._list_files(arguments)
+        elif tool_name == "list_bridge_sessions":
+            return LocalTools._list_sessions(arguments)
         return json.dumps({"error": f"Unknown local tool: {tool_name}"})
 
     @staticmethod
@@ -940,6 +952,16 @@ class LocalTools:
             return f"Wrote {len(content)} bytes to {p}"
         except Exception as e:
             return f"Error writing file: {e}"
+
+    @staticmethod
+    def _list_sessions(args: Dict[str, Any]) -> str:
+        sessions = SessionStore.list_sessions()
+        if not sessions:
+            return "No saved sessions."
+        lines = [f"{len(sessions)} saved session(s):"]
+        for s in sessions:
+            lines.append(f"  {s['name']}: {s['messages']} messages, last updated {s['updated']}")
+        return "\n".join(lines)
 
     @staticmethod
     def _list_files(args: Dict[str, Any]) -> str:
@@ -1048,6 +1070,9 @@ class DeepSeekFrappeBridge:
         """Send user message and resolve any tool calls. Returns final response text."""
         self.conversation.add_user(user_input)
 
+        last_tool: str = ""
+        same_tool_count: int = 0
+
         for _round in range(MAX_TOOL_ROUNDS):
             self.conversation.trim()
             messages = self.conversation.get_messages()
@@ -1061,6 +1086,20 @@ class DeepSeekFrappeBridge:
 
             # Model wants to call tools — execute them
             self.conversation.add_assistant(text, tool_calls)
+
+            # Detect infinite loops: same tool 3+ consecutive times
+            tool_names = [tc["function"]["name"] for tc in tool_calls]
+            if tool_names and all(n == tool_names[0] for n in tool_names):
+                if tool_names[0] == last_tool:
+                    same_tool_count += 1
+                    if same_tool_count >= 3:
+                        return (
+                            f"I called {tool_names[0]} {same_tool_count} times in a row without success. "
+                            "Let me try a different approach or ask the user for guidance."
+                        )
+                else:
+                    last_tool = tool_names[0]
+                    same_tool_count = 1
 
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]
@@ -1194,6 +1233,8 @@ class DeepSeekFrappeBridge:
                 print(" " * 30, end="\r")
         except KeyboardInterrupt:
             _print("\n  [dim]Cancelled.[/]")
+            if self.site_name and self.conversation:
+                SessionStore.save(self.site_name, self.conversation.messages)
             return
         except RuntimeError as exc:
             _print(f"\n[red]✗ Error:[/] {exc}")
