@@ -475,15 +475,54 @@ def _rule(title: str = "") -> None:
 
 
 def _ask(prompt: str) -> str:
-    # Use plain input() — works best for long text and pasting
-    # Print prompt with clear visual separation
+    """Read user input with multi-line paste support like Claude Code."""
     _print(prompt)
     try:
-        return input("  ")
+        first_line = input("  ")
     except KeyboardInterrupt:
         raise
     except EOFError:
         return ""
+
+    # Check if more lines were pasted (still in stdin buffer)
+    import select as _select
+    extra_lines = []
+    while True:
+        ready, _, _ = _select.select([sys.stdin], [], [], 0.05)
+        if not ready:
+            break
+        line = sys.stdin.readline()
+        if not line:
+            break
+        line = line.rstrip("\n")
+        if line:
+            extra_lines.append(line)
+
+    if extra_lines:
+        # Multi-line paste detected — show preview and confirm
+        all_lines = [first_line] + extra_lines
+        total = len(all_lines)
+        _print(f"\n  [dim]Pasted {total} lines. Press Enter to confirm, or type to edit:[/]")
+        preview = "\n".join(all_lines[:5])
+        if total > 5:
+            preview += f"\n  [dim]... and {total - 5} more lines[/]"
+        _print(f"  [dim]───[/]")
+        for line in all_lines[:5]:
+            _print(f"  [dim]│[/] {line[:120]}")
+        if total > 5:
+            _print(f"  [dim]│ ... ({total - 5} more lines)[/]")
+        _print(f"  [dim]───[/]")
+
+        try:
+            confirm = input("  ")
+        except (EOFError, KeyboardInterrupt):
+            return ""
+        if confirm.strip():
+            # User wants to edit — treat confirmation as the actual input
+            return confirm
+        return "\n".join(all_lines)
+
+    return first_line
 
 
 # ---------------------------------------------------------------------------
