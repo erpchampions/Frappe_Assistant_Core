@@ -39,14 +39,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse, parse_qs
 
-# Track interrupt state for graceful Ctrl+C handling
-_INTERRUPTED = False
-_ORIGINAL_SIGINT = signal.getsignal(signal.SIGINT)
-
+# Ctrl+C raises KeyboardInterrupt — works even during network calls
 def _handle_interrupt(sig, frame):
-    global _INTERRUPTED
-    _INTERRUPTED = True
-    print("\n  [yellow]Interrupted — returning to prompt...[/]")
+    raise KeyboardInterrupt()
 
 signal.signal(signal.SIGINT, _handle_interrupt)
 
@@ -1054,10 +1049,6 @@ class DeepSeekFrappeBridge:
         self.conversation.add_user(user_input)
 
         for _round in range(MAX_TOOL_ROUNDS):
-            global _INTERRUPTED
-            if _INTERRUPTED:
-                return "(cancelled)"
-
             self.conversation.trim()
             messages = self.conversation.get_messages()
 
@@ -1141,9 +1132,6 @@ class DeepSeekFrappeBridge:
 
         # Chat loop
         while True:
-            global _INTERRUPTED
-            _INTERRUPTED = False
-
             # Show queue status if items are pending
             with self._queue_lock:
                 pending = len(self._message_queue)
@@ -1179,7 +1167,6 @@ class DeepSeekFrappeBridge:
                 continue
 
             # Process message inline
-            _INTERRUPTED = False
             self._process_one(user_input)
 
     # ------------------------------------------------------------------
@@ -1197,7 +1184,6 @@ class DeepSeekFrappeBridge:
 
     def _process_one(self, user_input: str) -> None:
         """Process a single message and display the response."""
-        global _INTERRUPTED
         try:
             if HAS_RICH and console is not None:
                 with console.status("[dim]Thinking… (Ctrl+C to cancel)[/]", spinner="dots"):
@@ -1206,15 +1192,14 @@ class DeepSeekFrappeBridge:
                 print("Thinking… (Ctrl+C to cancel)", end="\r")
                 response = self.process_message(user_input)
                 print(" " * 30, end="\r")
-        except (RuntimeError, Exception) as exc:
-            if _INTERRUPTED:
-                _print("\n  [dim]Cancelled.[/]")
-                return
+        except KeyboardInterrupt:
+            _print("\n  [dim]Cancelled.[/]")
+            return
+        except RuntimeError as exc:
             _print(f"\n[red]✗ Error:[/] {exc}")
             return
-
-        if _INTERRUPTED:
-            _print("\n  [dim]Cancelled.[/]")
+        except Exception as exc:
+            _print(f"\n[red]✗ Unexpected error:[/] {exc}")
             return
 
         # Display response and auto-save
