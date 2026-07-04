@@ -1,12 +1,46 @@
 #!/usr/bin/env bash
-# FAC Bridge launcher — just run: fac <url> or fac <sitename>
+# FAC Bridge — fac <url> | fac <site> | fac --stop | fac --status | fac --log
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+PID_FILE="$HOME/.fac_bridge/pid"
+LOG_FILE="$HOME/.fac_bridge/server.log"
+
+case "${1:-}" in
+    --stop|-k)
+        if [ -f "$PID_FILE" ]; then
+            kill "$(cat "$PID_FILE")" 2>/dev/null
+            rm -f "$PID_FILE"
+        fi
+        # Also kill any lingering bridge on default port
+        lsof -ti:9090 2>/dev/null | xargs kill 2>/dev/null
+        echo "Bridge stopped."
+        exit 0
+        ;;
+    --status|-s)
+        if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+            echo "Bridge running on :9090 (PID $(cat "$PID_FILE"))"
+        else
+            echo "Bridge not running."
+        fi
+        exit 0
+        ;;
+    --log|-l)
+        cat "$LOG_FILE" 2>/dev/null || echo "No log."
+        exit 0
+        ;;
+esac
+
+# Kill existing
+[ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null
+lsof -ti:9090 2>/dev/null | xargs kill 2>/dev/null
+mkdir -p "$HOME/.fac_bridge"
+
 cd "$SCRIPT_DIR"
 
+# Run in foreground so user sees OAuth prompts, then it backgrounds itself
 if [ $# -eq 0 ]; then
-    python bridge.py serve
+    python bridge.py serve --bg
 elif [[ "$1" == http* ]]; then
-    python bridge.py serve -u "$1"
+    python bridge.py serve -u "$1" --bg
 else
-    python bridge.py serve "$@"
+    python bridge.py serve "$@" --bg
 fi

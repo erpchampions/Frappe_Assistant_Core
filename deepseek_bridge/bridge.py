@@ -439,7 +439,7 @@ class MCPServerBridge:
         self.tools: Dict[str, Dict[str, Any]] = {}  # prefixed_name -> {site, original_name, schema}
         self._lock = threading.Lock()
 
-    def start(self) -> None:
+    def start(self, background: bool = False) -> None:
         """Connect to all sites, discover tools, start HTTP server."""
         mgr = SiteManager()
         all_sites = mgr.list_sites()
@@ -480,6 +480,19 @@ class MCPServerBridge:
 
         # Auto-register with Claude Code
         _register_with_claude(self.port)
+
+        # Background if requested
+        if background:
+            pid = os.fork()
+            if pid != 0:
+                # Parent: write PID and exit
+                pid_file = os.path.join(CONFIG_DIR, "pid")
+                with open(pid_file, "w") as f:
+                    f.write(str(pid))
+                print(f"  Bridge running in background (PID {pid})")
+                print(f"  fac --stop  |  fac --status  |  fac --log\n")
+                sys.exit(0)
+            # Child: continue to serve
 
         # Start HTTP server
         handler = self._make_handler()
@@ -673,6 +686,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     serve_parser.add_argument("sites", nargs="*", help="Sites to serve (default: all saved)")
     serve_parser.add_argument("--url", "-u", help="FAC endpoint URL — auto-saves and connects (OAuth if first time)")
     serve_parser.add_argument("--port", "-p", type=int, default=DEFAULT_PORT, help=f"Port (default: {DEFAULT_PORT})")
+    serve_parser.add_argument("--bg", action="store_true", help="Background after OAuth/login")
 
     parser.add_argument("--add", action="store_true", help="Add a new FAC site interactively")
     parser.add_argument("--list", action="store_true", help="List saved FAC sites")
@@ -739,7 +753,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             all_sites = args.sites or None
 
         bridge = MCPServerBridge(port=args.port, sites=all_sites)
-        bridge.start()
+        bridge.start(background=args.bg)
         return
 
     # Default: no args → show help
