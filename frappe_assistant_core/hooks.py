@@ -165,6 +165,7 @@ scheduler_events = {
 override_whitelisted_methods = {
     "frappe.integrations.oauth2.openid_configuration": "frappe_assistant_core.api.oauth_discovery.openid_configuration",
     "frappe.integrations.oauth2.get_token": "frappe_assistant_core.api.oauth_token.get_token",
+    "frappe.integrations.oauth2.authorize": "frappe_assistant_core.api.oauth_authorize.authorize",
 }
 
 # Custom Page Renderers

@@ -1,0 +1,36 @@
+{% if not error %}
+<style>
+  /* Inline critical styles — works before full page CSS loads */
+  .fac-oauth-panel { background: #fff; border: 1px solid #d1d5db; border-radius: 8px; padding: 28px 24px; margin: 24px auto; max-width: 420px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+  .fac-oauth-panel h3 { font-size: 18px; margin: 0 0 4px 0; color: #111827; }
+  .fac-oauth-panel .sub { color: #6b7280; font-size: 13px; margin-bottom: 16px; }
+  .fac-oauth-panel ul { list-style: none; padding: 0; margin: 0 0 20px 0; }
+  .fac-oauth-panel li { padding: 7px 0; border-bottom: 1px solid #f3f4f6; font-size: 14px; color: #374151; }
+  .fac-oauth-panel li:last-child { border-bottom: none; }
+  .fac-oauth-btns { display: flex; gap: 12px; }
+  .fac-oauth-btn { flex: 1; padding: 10px 0; border-radius: 6px; font-size: 14px; font-weight: 600; text-align: center; text-decoration: none; display: inline-block; }
+  .fac-oauth-deny { background: #f3f4f6; color: #374151; border: 1px solid #d1d5db; }
+  .fac-oauth-deny:hover { background: #e5e7eb; }
+  .fac-oauth-allow { background: #1a56db; color: #fff; border: 1px solid #1a56db; }
+  .fac-oauth-allow:hover { background: #1e40af; }
+</style>
+<div class="fac-oauth-panel">
+  <h3>{{ _(client_id) }}</h3>
+  <p class="sub">{{ _("wants to access the following details from your account") }}</p>
+  <ul>
+  {% for dtl in details %}
+    <li>{{ _(dtl.title()) }}</li>
+  {% endfor %}
+  </ul>
+  <div class="fac-oauth-btns">
+    <a href="{{ failure_url | string }}" class="fac-oauth-btn fac-oauth-deny">{{ _("Deny") }}</a>
+    <a href="{{ success_url | string }}" class="fac-oauth-btn fac-oauth-allow">{{ _("Allow") }}</a>
+  </div>
+</div>
+{% else %}
+<div style="background:#fff;border:1px solid #fca5a5;border-radius:8px;padding:24px;margin:24px auto;max-width:420px;font-family:sans-serif;">
+  <h3 style="color:#dc2626;margin:0 0 8px 0;">{{ _("Authorization error for {}.").format(client_id) }}</h3>
+  <p style="color:#6b7280;">{{ _("An unexpected error occurred while authorizing {}.").format(client_id) }}</p>
+  <p style="color:#374151;">{{ error }}</p>
+</div>
+{% endif %}

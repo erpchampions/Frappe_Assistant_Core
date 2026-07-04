@@ -1,0 +1,1159 @@
+#!/usr/bin/env python3
+"""
+DeepSeek ↔ Frappe Assistant Core Bridge
+
+A terminal chat client that lets you use DeepSeek models to interact
+with your ERPNext system through the Frappe Assistant Core MCP server.
+
+Usage:
+    python bridge.py --mcp-url https://your-site.com/api/method/.../handle_mcp \\
+                     --api-key YOUR_FRAPPE_API_KEY \\
+                     --api-secret YOUR_FRAPPE_API_SECRET
+
+Or configure via environment variables:
+    export FRAUD_ASSISTANT_MCP_URL="https://..."
+    export FRAUD_ASSISTANT_API_KEY="..."
+    export FRAUD_ASSISTANT_API_SECRET="..."
+    export DEEPSEEK_API_KEY="sk-..."
+    python bridge.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import readline  # noqa: F401 — enables line-editing and history in input()
+import secrets
+import socket
+import sys
+import textwrap
+import time
+import webbrowser
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode, urlparse, parse_qs
+
+import requests
+
+# ---------------------------------------------------------------------------
+# Rich is optional — degrade gracefully if not installed
+# ---------------------------------------------------------------------------
+try:
+    from rich.console import Console
+    from rich.markdown import Markdown
+
+    console = Console()
+    HAS_RICH = True
+except ImportError:
+    console = None  # type: ignore[assignment]
+    HAS_RICH = False
+
+try:
+    from openai import OpenAI
+except ImportError:
+    print("Error: 'openai' package is required. Install with: pip install openai")
+    sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_MODEL = "deepseek-chat"
+MAX_TOOL_ROUNDS = 25  # prevent infinite tool-calling loops
+MCP_PROTOCOL_VERSION = "2025-06-18"
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".fac_bridge")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "sites.json")
+OAUTH_TIMEOUT = 120  # seconds to wait for browser login
+
+
+# ---------------------------------------------------------------------------
+# OAuth 2.0 flow — browser-based login (like Claude Desktop Connectors)
+# ---------------------------------------------------------------------------
+class OAuthFlow:
+    """Handles OAuth 2.0 authorization code flow with PKCE for FAC sites."""
+
+    @staticmethod
+    def discover(base_url: str) -> Dict[str, str]:
+        """Fetch OIDC discovery metadata from the Frappe site."""
+        base = base_url.rstrip("/")
+        # The base_url might be the full MCP endpoint path — extract the origin
+        parsed = urlparse(base)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        discovery_url = f"{origin}/.well-known/openid-configuration"
+        resp = requests.get(discovery_url, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+
+    @staticmethod
+    def generate_pkce() -> Tuple[str, str]:
+        """Generate PKCE code_verifier and code_challenge (S256). Returns (verifier, challenge)."""
+        verifier = secrets.token_urlsafe(64)[:128]
+        digest = hashlib.sha256(verifier.encode()).digest()
+        challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+        return verifier, challenge
+
+    @staticmethod
+    def find_free_port() -> int:
+        """Find a free TCP port on localhost."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+
+    @staticmethod
+    def register_client(registration_url: str, redirect_uri: str) -> Dict[str, str]:
+        """Register as an OAuth client via RFC 7591 dynamic registration."""
+        payload = {
+            "client_name": "DeepSeek FAC Bridge",
+            "redirect_uris": [redirect_uri],
+            "token_endpoint_auth_method": "client_secret_basic",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "scope": "all openid",
+            "software_id": "deepseek-fac-bridge",
+            "software_version": "1.0.0",
+        }
+        resp = requests.post(registration_url, json=payload, timeout=15)
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"OAuth client registration failed ({resp.status_code}): {resp.text[:300]}"
+            )
+        return resp.json()
+
+    @classmethod
+    def authorize(cls, fac_url: str) -> Dict[str, Any]:
+        """
+        Full OAuth authorization flow.
+
+        Uses Frappe's callback endpoint as redirect_uri — no local server needed.
+        The bridge polls for the code after the user approves in browser.
+        """
+        base = fac_url.rstrip("/")
+        origin = f"{urlparse(base).scheme}://{urlparse(base).netloc}"
+
+        # 1. Discover OAuth endpoints
+        print("  Discovering OAuth endpoints…", end="\r")
+        metadata = cls.discover(base)
+        auth_endpoint = metadata["authorization_endpoint"]
+        token_endpoint = metadata["token_endpoint"]
+        registration_endpoint = metadata.get("registration_endpoint")
+        print("  " + " " * 40, end="\r")
+
+        # 2. Generate PKCE
+        code_verifier, code_challenge = cls.generate_pkce()
+
+        # 3. Use Frappe's callback endpoint as redirect_uri (works across setups)
+        callback_url = f"{origin}/api/method/frappe_assistant_core.api.oauth_callback.callback"
+        state = secrets.token_urlsafe(16)
+
+        if registration_endpoint:
+            print("  Registering OAuth client…", end="\r")
+            reg = cls.register_client(registration_endpoint, callback_url)
+            client_id = reg["client_id"]
+            client_secret = reg.get("client_secret", "")
+            print("  " + " " * 40, end="\r")
+        else:
+            raise RuntimeError(
+                "Dynamic client registration is not enabled on this FAC site.\n"
+                "  → Use API key auth instead: python bridge.py --add (choose option 2)"
+            )
+
+        # 4. Build authorization URL
+        auth_params = {
+            "client_id": client_id,
+            "response_type": "code",
+            "redirect_uri": callback_url,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "scope": "all openid",
+            "state": state,
+        }
+        approve_url = f"{auth_endpoint.replace('authorize', 'approve')}?{urlencode(auth_params)}"
+
+        # 5. Show instructions
+        print(f"\n  [bold]→ Step 1:[/] Log into your Frappe site:")
+        print(f"    [cyan]{origin}[/]")
+        print(f"\n  [bold]→ Step 2:[/] Open this URL in the [bold]same browser:[/]")
+        print(f"    [cyan]{approve_url}[/]\n")
+        print(f"  [dim]The page will confirm authorization — then you can close it.[/]")
+
+        try:
+            webbrowser.open(approve_url)
+        except Exception:
+            pass
+
+        # 6. Poll for the authorization code
+        print("  Waiting for authorization in browser…", end="\r")
+        poll_url = f"{origin}/api/method/frappe_assistant_core.api.oauth_callback.get_code?state={state}"
+        code: Optional[str] = None
+        deadline = time.time() + OAUTH_TIMEOUT
+        while time.time() < deadline:
+            try:
+                resp = requests.get(poll_url, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    # Frappe wraps responses in "message"
+                    inner = data.get("message", data)
+                    code = inner.get("code")
+                    if code:
+                        print("  " + " " * 50, end="\r")
+                        break
+                    if inner.get("error"):
+                        raise RuntimeError(f"Authorization failed: {inner['error']}")
+            except requests.RequestException:
+                pass
+            time.sleep(1)
+
+        if not code:
+            raise RuntimeError(
+                "Authorization timed out.\n"
+                "  → Make sure you opened the URL in a browser where you're logged into Frappe."
+            )
+
+        # 8. Exchange code for tokens
+        print("  Exchanging code for tokens…", end="\r")
+        basic_auth = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        token_resp = requests.post(
+            token_endpoint,
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": callback_url,
+                "code_verifier": code_verifier,
+            },
+            headers={"Authorization": f"Basic {basic_auth}"},
+            timeout=15,
+        )
+        if token_resp.status_code != 200:
+            raise RuntimeError(f"Token exchange failed ({token_resp.status_code}): {token_resp.text[:300]}")
+        tokens = token_resp.json()
+        print("  " + " " * 40, end="\r")
+
+        # 9. Return credentials
+        return {
+            "access_token": tokens["access_token"],
+            "refresh_token": tokens.get("refresh_token", ""),
+            "expires_in": tokens.get("expires_in", 3600),
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "token_endpoint": token_endpoint,
+        }
+
+
+def _refresh_access_token(site_config: Dict[str, str]) -> Optional[str]:
+    """Try to refresh an expired access token. Returns new access_token or None."""
+    refresh_token = site_config.get("refresh_token")
+    client_id = site_config.get("client_id")
+    client_secret = site_config.get("client_secret")
+    token_endpoint = site_config.get("token_endpoint")
+
+    if not all([refresh_token, client_id, client_secret, token_endpoint]):
+        return None
+
+    try:
+        basic_auth = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        resp = requests.post(
+            token_endpoint,
+            data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+            headers={"Authorization": f"Basic {basic_auth}"},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            new_token = data.get("access_token")
+            if new_token:
+                site_config["access_token"] = new_token
+                site_config["expires_in"] = data.get("expires_in", 3600)
+                site_config["token_obtained_at"] = str(int(time.time()))
+                if "refresh_token" in data:
+                    site_config["refresh_token"] = data["refresh_token"]
+                return new_token
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Site manager — saved FAC connectors (like Claude Desktop Connectors)
+# ---------------------------------------------------------------------------
+class SiteManager:
+    """Manages saved FAC sites in ~/.fac_bridge/sites.json."""
+
+    def __init__(self) -> None:
+        self._path = CONFIG_FILE
+
+    def _load(self) -> Dict[str, Any]:
+        if not os.path.exists(self._path):
+            return {}
+        with open(self._path) as f:
+            return json.load(f)
+
+    def _save(self, data: Dict[str, Any]) -> None:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(self._path, "w") as f:
+            json.dump(data, f, indent=2)
+        os.chmod(self._path, 0o600)
+
+    def list_sites(self) -> Dict[str, Dict[str, str]]:
+        data = self._load()
+        return data.get("sites", {})
+
+    def add(self, name: str, site_data: Dict[str, Any]) -> None:
+        data = self._load()
+        data.setdefault("sites", {})[name] = site_data
+        self._save(data)
+
+    def remove(self, name: str) -> bool:
+        data = self._load()
+        if "sites" in data and name in data["sites"]:
+            del data["sites"][name]
+            self._save(data)
+            return True
+        return False
+
+    def get(self, name: str) -> Optional[Dict[str, str]]:
+        return self.list_sites().get(name)
+
+    @staticmethod
+    def suggest_name(url: str) -> str:
+        hostname = urlparse(url).hostname or "site"
+        return hostname.split(".")[0]
+
+
+# ---------------------------------------------------------------------------
+# Interactive helpers
+# ---------------------------------------------------------------------------
+def _pick_site(sites: Dict[str, Dict[str, str]]) -> Optional[str]:
+    """Show a numbered menu of saved sites. Returns the chosen name or None."""
+    names = list(sites.keys())
+    if not names:
+        return None
+
+    if len(names) == 1:
+        name = names[0]
+        url = sites[name].get("url", "")
+        print(f"\n  Only one site: [bold]{name}[/] ({urlparse(url).hostname})")
+        if _confirm("  Connect?"):
+            return name
+        return None
+
+    print(f"\n  [bold]FAC Sites:[/]")
+    for i, name in enumerate(names, 1):
+        url = sites[name].get("url", "")
+        host = urlparse(url).hostname if "://" in url else url
+        print(f"    {i}. [cyan]{name:<22}[/] ({host})")
+
+    while True:
+        choice = input(f"\n  Choose [1-{len(names)} or name]: ").strip()
+        if choice in names:
+            return choice
+        try:
+            idx = int(choice)
+            if 1 <= idx <= len(names):
+                return names[idx - 1]
+        except ValueError:
+            pass
+        print(f"  [yellow]Invalid. Pick 1-{len(names)} or a site name.[/]")
+
+
+def _add_site_interactive() -> Optional[str]:
+    """Prompt for FAC URL, authenticate (OAuth or API key), save as a new site. Returns name or None."""
+    print("\n  [bold]Add a new FAC site[/]")
+    print("  ───────────────────")
+
+    url = input("  FAC Endpoint URL: ").strip()
+    if not url:
+        print("  [red]✗[/] URL is required.")
+        return None
+
+    hostname = urlparse(url).hostname or "unknown"
+    suggested = SiteManager.suggest_name(url)
+    print(f"\n  [dim]✓ Detected: {hostname}[/]")
+
+    name = input(f"  Short name [[cyan]{suggested}[/]]: ").strip()
+    if not name:
+        name = suggested
+
+    mgr = SiteManager()
+    existing = mgr.list_sites()
+    if name in existing:
+        print(f"  [yellow]⚠ Site \"{name}\" already exists.[/]")
+        if not _confirm("  Overwrite?"):
+            return None
+
+    # Ask: OAuth (browser) or API Key?
+    print()
+    print("  [bold]Authentication method:[/]")
+    print("    1. [cyan]OAuth (browser login)[/] — opens browser, log in, done")
+    print("    2. [cyan]API Key + Secret[/] — paste credentials")
+
+    choice = input("  Choose [1]: ").strip()
+    use_api_key = choice == "2"
+
+    if use_api_key:
+        api_key = input("  API Key: ").strip()
+        api_secret = input("  API Secret: ").strip()
+        if not api_key or not api_secret:
+            print("  [red]✗[/] API Key and Secret are required.")
+            return None
+        oauth_data = {}
+    else:
+        # OAuth flow
+        try:
+            oauth_data = OAuthFlow.authorize(url)
+            print(f"\n  [green]✓[/] Authenticated via OAuth!")
+        except Exception as e:
+            print(f"\n  [red]✗ OAuth failed:[/] {e}")
+            print("  [dim]Tip: Use API key auth instead — re-run --add and choose option 2.[/]")
+            return None
+        api_key = ""
+        api_secret = ""
+
+    site_data: Dict[str, Any] = {
+        "url": url,
+        "api_key": api_key,
+        "api_secret": api_secret,
+    }
+    if oauth_data:
+        site_data.update(oauth_data)
+
+    mgr.add(name, site_data)
+    msg = f"[green]✓[/] \"{name}\" saved. Connect with: [bold]python bridge.py {name}[/]"
+    print(f"\n  {msg}")
+    return name
+
+
+def _confirm(prompt: str) -> bool:
+    """Ask a yes/no question. Returns True for yes. Defaults to yes on EOF."""
+    try:
+        ans = input(f"{prompt} [Y/n]: ").strip().lower()
+    except EOFError:
+        ans = ""
+    return ans in ("", "y", "yes")
+
+
+# ---------------------------------------------------------------------------
+# Terminal helpers (with / without Rich)
+# ---------------------------------------------------------------------------
+def _print(text: str = "", **kwargs: Any) -> None:
+    """Print to console, Rich-aware."""
+    if HAS_RICH and console is not None:
+        console.print(text, **kwargs)
+    else:
+        # Strip Rich markup tags for plain-text fallback
+        import re
+        clean = re.sub(r"\[/?\w+\]", "", text)
+        print(clean)
+
+
+def _markdown(text: str) -> None:
+    """Render markdown if Rich is available."""
+    if HAS_RICH and console is not None:
+        console.print(Markdown(text))
+    else:
+        print(text)
+
+
+def _rule(title: str = "") -> None:
+    if HAS_RICH and console is not None:
+        console.rule(title)
+    elif title:
+        print(f"\n─── {title} ───")
+
+
+def _ask(prompt: str) -> str:
+    if HAS_RICH and console is not None:
+        from rich.prompt import Prompt
+        return Prompt.ask(prompt)
+    return input(prompt + " ")
+
+
+# ---------------------------------------------------------------------------
+# MCP Client
+# ---------------------------------------------------------------------------
+class MCPClient:
+    """Lightweight JSON-RPC 2.0 client for the Frappe MCP server.
+
+    Supports two auth methods:
+    - Bearer token (OAuth):  Authorization: Bearer <token>
+    - API key/secret:        Authorization: token <key>:<secret>
+    """
+
+    def __init__(
+        self,
+        url: str,
+        api_key: str = "",
+        api_secret: str = "",
+        bearer_token: str = "",
+        on_token_refresh: Any = None,  # callback to persist refreshed tokens
+    ) -> None:
+        # Sanitize: strip whitespace, newlines, and trailing slash
+        self.url = url.strip().rstrip("/").replace("\n", "").replace("\r", "").replace(" ", "")
+        self._request_id = 0
+        self._bearer_token = bearer_token.strip() if bearer_token else ""
+        self._on_token_refresh = on_token_refresh
+        self.session = requests.Session()
+        self.session.headers.update(
+            {"Content-Type": "application/json", "Accept": "application/json"}
+        )
+
+        if self._bearer_token:
+            self.session.headers["Authorization"] = f"Bearer {self._bearer_token}"
+        else:
+            api_key = api_key.strip().replace("\n", "").replace("\r", "").replace(" ", "")
+            api_secret = api_secret.strip().replace("\n", "").replace("\r", "").replace(" ", "")
+            self.session.headers["Authorization"] = f"token {api_key}:{api_secret}"
+
+    # ------------------------------------------------------------------
+    # Low-level RPC
+    # ------------------------------------------------------------------
+    def _call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Send a JSON-RPC request and return the result dict. Auto-refreshes Bearer tokens on 401."""
+        return self._do_call(method, params, is_retry=False)
+
+    def _do_call(self, method: str, params: Optional[Dict[str, Any]] = None, is_retry: bool = False) -> Dict[str, Any]:
+        self._request_id += 1
+        payload: Dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "id": self._request_id,
+            "method": method,
+            "params": params or {},
+        }
+
+        try:
+            resp = self.session.post(self.url, json=payload, timeout=60)
+        except requests.ConnectionError:
+            raise ConnectionError(
+                f"Cannot reach MCP server at {self.url}\n"
+                "  → Check that the URL is correct and the Frappe server is running."
+            )
+        except requests.Timeout:
+            raise ConnectionError(f"MCP server timed out at {self.url}")
+
+        # Auto-refresh Bearer token on 401 (only once)
+        if resp.status_code == 401 and self._bearer_token and not is_retry and self._on_token_refresh:
+            new_token = self._on_token_refresh()
+            if new_token:
+                self._bearer_token = new_token
+                self.session.headers["Authorization"] = f"Bearer {new_token}"
+                return self._do_call(method, params, is_retry=True)
+
+        if resp.status_code == 401:
+            auth_msg = (
+                "OAuth token expired and refresh failed. Re-add the site with: python bridge.py --add"
+                if self._bearer_token
+                else "Authentication failed (401). Check your API key and secret.\n"
+                     "  → Generate them in Frappe: User → API Access → Generate Keys"
+            )
+            raise PermissionError(auth_msg)
+        if resp.status_code == 403:
+            raise PermissionError(
+                "Access denied (403). Make sure 'Assistant Enabled' is checked on your User record."
+            )
+
+        resp.raise_for_status()
+
+        try:
+            data = resp.json()
+        except json.JSONDecodeError:
+            raise RuntimeError(f"MCP server returned non-JSON response:\n{resp.text[:500]}")
+
+        if "error" in data:
+            err = data["error"]
+            raise RuntimeError(f"MCP Error [{err.get('code')}]: {err.get('message')}")
+
+        return data.get("result", {})
+
+    # ------------------------------------------------------------------
+    # MCP protocol methods
+    # ------------------------------------------------------------------
+    def initialize(self) -> Dict[str, Any]:
+        """Perform MCP initialize handshake."""
+        return self._call(
+            "initialize",
+            {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "deepseek-frappe-bridge", "version": "1.0.0"},
+            },
+        )
+
+    def list_tools(self) -> List[Dict[str, Any]]:
+        """Retrieve the list of available tools from the MCP server."""
+        result = self._call("tools/list")
+        return result.get("tools", [])
+
+    def call_tool(self, name: str, arguments: Dict[str, Any]) -> str:
+        """Execute a tool on the MCP server and return its text output."""
+        result = self._call("tools/call", {"name": name, "arguments": arguments})
+
+        content = result.get("content", [])
+        # Extract text from content blocks (MCP spec)
+        texts: List[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                texts.append(block["text"])
+
+        return "\n".join(texts) if texts else json.dumps(result, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Tool format conversion  (MCP → DeepSeek / OpenAI function format)
+# ---------------------------------------------------------------------------
+def mcp_tools_to_openai(mcp_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert MCP tool definitions to OpenAI/DeepSeek function-calling format."""
+    converted: List[Dict[str, Any]] = []
+    for tool in mcp_tools:
+        schema = tool.get("inputSchema", {})
+        # MCP uses "inputSchema"; OpenAI uses "parameters"
+        params: Dict[str, Any] = {
+            "type": schema.get("type", "object"),
+            "properties": schema.get("properties", {}),
+        }
+        if "required" in schema:
+            params["required"] = schema["required"]
+
+        converted.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "parameters": params,
+                },
+            }
+        )
+    return converted
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek chat engine
+# ---------------------------------------------------------------------------
+class DeepSeekChat:
+    """Wraps the OpenAI-compatible DeepSeek API with tool-calling support."""
+
+    def __init__(self, api_key: str, model: str = DEEPSEEK_MODEL) -> None:
+        self.client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+        self.model = model
+
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+        """
+        Send messages to DeepSeek. Returns (text_content, tool_calls_or_None).
+
+        When the model wants to call tools, text_content will be empty and
+        tool_calls will contain the requested invocations.
+        """
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 4096,
+        }
+
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+
+        try:
+            response = self.client.chat.completions.create(**kwargs)  # type: ignore[arg-type]
+        except Exception as exc:
+            raise RuntimeError(f"DeepSeek API error: {exc}") from exc
+
+        choice = response.choices[0]
+        content = choice.message.content or ""
+        tool_calls = choice.message.tool_calls
+
+        if tool_calls:
+            return content, [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ]
+
+        return content, None
+
+
+# ---------------------------------------------------------------------------
+# Conversation manager
+# ---------------------------------------------------------------------------
+class Conversation:
+    """Manages the message history for a chat session."""
+
+    def __init__(self, system_prompt: Optional[str] = None) -> None:
+        self.messages: List[Dict[str, Any]] = []
+        if system_prompt:
+            self.messages.append({"role": "system", "content": system_prompt})
+
+    def add_user(self, content: str) -> None:
+        self.messages.append({"role": "user", "content": content})
+
+    def add_assistant(self, content: str, tool_calls: Optional[List[Dict[str, Any]]] = None) -> None:
+        msg: Dict[str, Any] = {"role": "assistant", "content": content or None}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        self.messages.append(msg)
+
+    def add_tool_result(self, tool_call_id: str, tool_name: str, content: str) -> None:
+        self.messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "name": tool_name,
+                "content": content,
+            }
+        )
+
+    def get_messages(self) -> List[Dict[str, Any]]:
+        return self.messages
+
+    def trim(self, max_messages: int = 50) -> None:
+        """Keep message history from growing too large."""
+        if len(self.messages) > max_messages:
+            # Always keep the system message if present
+            start = 1 if self.messages[0].get("role") == "system" else 0
+            self.messages = self.messages[:start] + self.messages[-(max_messages - start):]
+
+
+# ---------------------------------------------------------------------------
+# Bridge orchestrator
+# ---------------------------------------------------------------------------
+class DeepSeekFrappeBridge:
+    """Orchestrates the DeepSeek ↔ Frappe MCP bridge conversation loop."""
+
+    def __init__(
+        self,
+        mcp_url: str,
+        api_key: str = "",
+        api_secret: str = "",
+        deepseek_api_key: str = "",
+        bearer_token: str = "",
+        model: str = DEEPSEEK_MODEL,
+        verbose: bool = False,
+        on_token_refresh: Any = None,
+    ) -> None:
+        self.verbose = verbose
+        self.mcp = MCPClient(
+            url=mcp_url,
+            api_key=api_key,
+            api_secret=api_secret,
+            bearer_token=bearer_token,
+            on_token_refresh=on_token_refresh,
+        )
+        self.chat = DeepSeekChat(deepseek_api_key, model)
+        self.conversation: Optional[Conversation] = None
+        self.tools_openai: List[Dict[str, Any]] = []
+        self.tool_names: List[str] = []
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+    def connect(self) -> List[Dict[str, Any]]:
+        """Initialize MCP session and discover tools. Returns tool list."""
+        # 1. Initialize MCP session
+        init_result = self.mcp.initialize()
+        server_name = init_result.get("serverInfo", {}).get("name", "unknown")
+        protocol = init_result.get("protocolVersion", "unknown")
+        _print(f"[green]✓[/] Connected to [bold]{server_name}[/] (MCP {protocol})")
+
+        # 2. Discover tools
+        mcp_tools = self.mcp.list_tools()
+        self.tools_openai = mcp_tools_to_openai(mcp_tools)
+        self.tool_names = [t["name"] for t in mcp_tools]
+
+        _print(f"[green]✓[/] Discovered [bold]{len(mcp_tools)}[/] tools")
+        if self.verbose:
+            for t in mcp_tools:
+                _print(f"  • [cyan]{t['name']}[/] — {t.get('description', '')[:80]}")
+
+        return mcp_tools
+
+    # ------------------------------------------------------------------
+    # Single exchange
+    # ------------------------------------------------------------------
+    def process_message(self, user_input: str) -> str:
+        """Send user message and resolve any tool calls. Returns final response text."""
+        self.conversation.add_user(user_input)
+
+        for _round in range(MAX_TOOL_ROUNDS):
+            self.conversation.trim()
+            messages = self.conversation.get_messages()
+
+            # Send to DeepSeek
+            text, tool_calls = self.chat.chat(messages, tools=self.tools_openai)
+
+            # No tool calls → this is the final answer
+            if not tool_calls:
+                return text or "(no response)"
+
+            # Model wants to call tools — execute them
+            self.conversation.add_assistant(text, tool_calls)
+
+            for tc in tool_calls:
+                fn_name = tc["function"]["name"]
+                try:
+                    fn_args = json.loads(tc["function"]["arguments"])
+                except json.JSONDecodeError:
+                    fn_args = {}
+
+                _print(f"  [dim]🔧 Calling [cyan]{fn_name}[/]…[/]")
+
+                try:
+                    result_text = self.mcp.call_tool(fn_name, fn_args)
+                except Exception as exc:
+                    result_text = f"Error: {exc}"
+
+                # Truncate very large results (but keep enough context)
+                if len(result_text) > 8000:
+                    result_text = result_text[:8000] + "\n… [truncated]"
+
+                self.conversation.add_tool_result(tc["id"], fn_name, result_text)
+
+        return "⚠️ Reached maximum tool-calling rounds — the task may be too complex."
+
+    # ------------------------------------------------------------------
+    # Interactive loop
+    # ------------------------------------------------------------------
+    def run(self) -> None:
+        """Main interactive chat loop."""
+        # Connect and discover tools
+        try:
+            mcp_tools = self.connect()
+        except (ConnectionError, PermissionError, RuntimeError) as exc:
+            _print(f"\n[red]✗ Connection failed:[/] {exc}")
+            sys.exit(1)
+
+        if not mcp_tools:
+            _print("\n[yellow]⚠ No tools discovered. The assistant can chat but cannot access ERPNext data.[/]")
+
+        # Build system prompt
+        system_prompt = textwrap.dedent(f"""\
+            You are a helpful ERPNext assistant powered by DeepSeek. You have access to
+            {len(mcp_tools)} tools that let you interact with the ERPNext system.
+
+            Available tools: {', '.join(self.tool_names[:20])}
+            {"… and more" if len(self.tool_names) > 20 else ""}
+
+            Guidelines:
+            - Use the tools to look up, create, or update information in ERPNext.
+            - When searching, be specific with doctype names (e.g., "Customer", "Sales Invoice").
+            - Always confirm when creating or modifying records.
+            - If a tool returns an error, explain the issue to the user and suggest a fix.
+            - Format your responses clearly using markdown.
+            - If you don't have a tool for something, tell the user what you'd need.
+        """)
+
+        self.conversation = Conversation(system_prompt)
+
+        # Print welcome banner
+        _rule("DeepSeek + Frappe Assistant Core")
+        _markdown(
+            f"Connected to [bold]{self.mcp.url}[/] with [bold]{len(mcp_tools)} tools[/].\n"
+            f"Model: [bold]{self.chat.model}[/]\n"
+            "Type [bold]/help[/] for commands, [bold]/exit[/] to quit.\n"
+            "Your data stays on your Frappe server — only chat messages go to DeepSeek."
+        )
+        _rule()
+
+        # Chat loop
+        while True:
+            try:
+                user_input = _ask("\n[bold blue]You[/]")
+            except (EOFError, KeyboardInterrupt):
+                _print("\n[dim]Goodbye![/]")
+                break
+
+            user_input = user_input.strip()
+            if not user_input:
+                continue
+
+            # Handle commands
+            if user_input.startswith("/"):
+                self._handle_command(user_input)
+                continue
+
+            # Process message (show status while waiting for DeepSeek)
+            try:
+                if HAS_RICH and console is not None:
+                    with console.status("[dim]Thinking…[/]", spinner="dots"):
+                        response = self.process_message(user_input)
+                else:
+                    print("Thinking…", end="\r")
+                    response = self.process_message(user_input)
+                    print(" " * 20, end="\r")  # clear the line
+            except RuntimeError as exc:
+                _print(f"\n[red]✗ Error:[/] {exc}")
+                continue
+            except Exception as exc:
+                _print(f"\n[red]✗ Unexpected error:[/] {exc}")
+                continue
+
+            # Display response
+            _print()
+            _markdown(response)
+
+    # ------------------------------------------------------------------
+    # Commands
+    # ------------------------------------------------------------------
+    def _handle_command(self, cmd: str) -> None:
+        """Handle slash commands."""
+        cmd = cmd.lower().strip()
+
+        if cmd in ("/exit", "/quit"):
+            _print("[dim]Goodbye![/]")
+            sys.exit(0)
+
+        elif cmd == "/help":
+            _markdown(
+                textwrap.dedent("""\
+                **Available Commands:**
+                - `/tools` — list all available MCP tools
+                - `/clear` — clear conversation history and start fresh
+                - `/history` — show conversation message count
+                - `/help`  — show this help
+                - `/exit`  — quit the bridge
+            """)
+            )
+
+        elif cmd == "/tools":
+            if not self.tool_names:
+                _print("[dim]No tools available.[/]")
+                return
+            _print(f"\n[bold]Available Tools ({len(self.tool_names)}):[/]")
+            for name in self.tool_names:
+                _print(f"  • [cyan]{name}[/]")
+
+        elif cmd == "/clear":
+            if self.conversation:
+                sys_msg = self.conversation.messages[0] if self.conversation.messages else None
+                self.conversation = Conversation(
+                    system_prompt=sys_msg["content"] if sys_msg and sys_msg.get("role") == "system" else None
+                )
+            _print("[green]✓[/] Conversation history cleared.")
+
+        elif cmd == "/history":
+            count = len(self.conversation.messages) if self.conversation else 0
+            _print(f"[dim]Messages in history: {count}[/]")
+
+        else:
+            _print(f"[yellow]Unknown command:[/] {cmd} — type /help for available commands.")
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="DeepSeek ↔ Frappe Assistant Core Bridge",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Examples:
+              # Connect to a saved site
+              python bridge.py v15upgrade
+
+              # Pick from saved sites interactively
+              python bridge.py
+
+              # Manage sites
+              python bridge.py --add
+              python bridge.py --list
+              python bridge.py --remove
+
+              # Direct connection (env vars or CLI flags)
+              export FRAUD_ASSISTANT_MCP_URL="https://..."
+              export FRAUD_ASSISTANT_API_KEY="..."
+              export FRAUD_ASSISTANT_API_SECRET="..."
+              python bridge.py
+        """),
+    )
+
+    # Positional: site name
+    parser.add_argument(
+        "site",
+        nargs="?",
+        default=None,
+        help="Name of a saved FAC site to connect to",
+    )
+
+    # Site management
+    parser.add_argument("--add", action="store_true", help="Add a new FAC site interactively")
+    parser.add_argument("--list", action="store_true", help="List saved FAC sites")
+    parser.add_argument("--remove", action="store_true", help="Remove a saved FAC site")
+
+    # Direct connection settings (overrides)
+    parser.add_argument(
+        "--mcp-url",
+        default=os.environ.get("FRAUD_ASSISTANT_MCP_URL", ""),
+        help="MCP endpoint URL (env: FRAUD_ASSISTANT_MCP_URL)",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("FRAUD_ASSISTANT_API_KEY", ""),
+        help="Frappe API key (env: FRAUD_ASSISTANT_API_KEY)",
+    )
+    parser.add_argument(
+        "--api-secret",
+        default=os.environ.get("FRAUD_ASSISTANT_API_SECRET", ""),
+        help="Frappe API secret (env: FRAUD_ASSISTANT_API_SECRET)",
+    )
+    parser.add_argument(
+        "--deepseek-api-key",
+        default=os.environ.get("DEEPSEEK_API_KEY", ""),
+        help="DeepSeek API key (env: DEEPSEEK_API_KEY)",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("DEEPSEEK_MODEL", DEEPSEEK_MODEL),
+        help=f"DeepSeek model to use (default: {DEEPSEEK_MODEL})",
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", help="Show detailed tool discovery and debug info",
+    )
+
+    args = parser.parse_args(argv)
+    mgr = SiteManager()
+
+    # --- Site management commands (short-circuit) ---
+    if args.list:
+        sites = mgr.list_sites()
+        if not sites:
+            print("No FAC sites saved.")
+            print("Add one with: python bridge.py --add")
+        else:
+            print(f"\n[bold]Saved FAC sites ({len(sites)}):[/]")
+            for name, cfg in sites.items():
+                host = urlparse(cfg["url"]).hostname or cfg["url"]
+                print(f"  [cyan]{name:<22}[/] {host}")
+        return
+
+    if args.remove:
+        sites = mgr.list_sites()
+        if not sites:
+            print("No FAC sites to remove.")
+            return
+        name = _pick_site(sites)
+        if name and _confirm(f"Remove \"{name}\"?"):
+            mgr.remove(name)
+            print(f"[green]✓[/] \"{name}\" removed.")
+        return
+
+    if args.add:
+        name = _add_site_interactive()
+        if name:
+            if _confirm("\n  Connect now?"):
+                site = mgr.get(name)
+                assert site is not None
+                site_name_for_refresh = name
+            else:
+                return
+        else:
+            return
+    else:
+        # --- Resolve connection config ---
+        # Priority: CLI flags > env vars > positional site > interactive picker
+        mcp_url = args.mcp_url
+        api_key = args.api_key
+        api_secret = args.api_secret
+
+        if mcp_url and api_key and api_secret:
+            # Full config from env vars or CLI flags — use directly
+            site = None
+            site_name_for_refresh = ""
+        elif args.site:
+            site = mgr.get(args.site)
+            if not site:
+                print(f"[red]✗[/] Site \"{args.site}\" not found.")
+                sites = mgr.list_sites()
+                if sites:
+                    print(f"  Available: {', '.join(sites.keys())}")
+                print("  Add it with: python bridge.py --add")
+                sys.exit(1)
+            site_name_for_refresh = args.site
+        elif not mcp_url:
+            sites = mgr.list_sites()
+            if not sites:
+                print("\n  [bold]No FAC sites configured.[/]")
+                print("  Paste your FAC Endpoint URL to get started.\n")
+                name = _add_site_interactive()
+                if not name:
+                    sys.exit(0)
+                site = mgr.get(name)
+                assert site is not None
+                site_name_for_refresh = name
+            else:
+                name = _pick_site(sites)
+                if not name:
+                    print("  [dim]Cancelled.[/]")
+                    sys.exit(0)
+                site = mgr.get(name)
+                assert site is not None
+                site_name_for_refresh = name
+
+    # --- Extract credentials from site config ---
+    if site:
+        mcp_url = site["url"]
+        api_key = site.get("api_key", "")
+        api_secret = site.get("api_secret", "")
+        bearer_token = site.get("access_token", "")
+    else:
+        bearer_token = ""
+
+    # --- Token refresh callback (persists refreshed tokens to sites.json) ---
+    def _persist_refreshed_token(new_token: str) -> bool:
+        if not site_name_for_refresh or not site:
+            return False
+        mgr2 = SiteManager()
+        site_data = mgr2.get(site_name_for_refresh)
+        if site_data:
+            site_data["access_token"] = new_token
+            site_data["token_obtained_at"] = str(int(time.time()))
+            mgr2.add(site_name_for_refresh, site_data)
+        return True
+
+    # Check if OAuth token might need refresh (older than 80% of expiry)
+    if bearer_token and site:
+        expires_in = int(site.get("expires_in", 3600))
+        obtained = int(site.get("token_obtained_at", "0"))
+        if obtained and time.time() - obtained > expires_in * 0.8:
+            new_token = _refresh_access_token(site)
+            if new_token:
+                bearer_token = new_token
+                _persist_refreshed_token(new_token)
+
+    on_token_refresh = (lambda t: _refresh_access_token(site) if site else None) if site and bearer_token else None
+
+    # --- Validate DeepSeek key ---
+    deepseek_api_key = args.deepseek_api_key
+    if not deepseek_api_key:
+        print("[red]✗[/] DeepSeek API key is required.")
+        print("  Set it via DEEPSEEK_API_KEY env variable or --deepseek-api-key flag.")
+        print("  Get a key at: https://platform.deepseek.com")
+        sys.exit(1)
+
+    # --- Launch ---
+    bridge = DeepSeekFrappeBridge(
+        mcp_url=mcp_url,
+        api_key=api_key,
+        api_secret=api_secret,
+        deepseek_api_key=deepseek_api_key,
+        bearer_token=bearer_token,
+        model=args.model,
+        verbose=args.verbose,
+        on_token_refresh=on_token_refresh,
+    )
+    bridge.run()
+
+
+if __name__ == "__main__":
+    main()
