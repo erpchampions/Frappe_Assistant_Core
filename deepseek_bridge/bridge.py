@@ -477,7 +477,9 @@ class MCPServerBridge:
 
         print(f"\n  Bridge running on [bold]http://localhost:{self.port}[/]")
         print(f"  {len(self.tools)} tools from {len(self.clients)} site(s)")
-        print(f"  Add to Claude Code as an MCP connector.\n")
+
+        # Auto-register with Claude Code
+        _register_with_claude(self.port)
 
         # Start HTTP server
         handler = self._make_handler()
@@ -598,6 +600,54 @@ class MCPServerBridge:
                 pass  # suppress HTTP logs
 
         return Handler
+
+
+# ---------------------------------------------------------------------------
+# Claude Code integration
+# ---------------------------------------------------------------------------
+def _register_with_claude(port: int) -> None:
+    """Auto-register the bridge as an MCP server in Claude Code settings."""
+    settings_paths = [
+        os.path.join(os.path.expanduser("~"), ".claude", "settings.json"),
+        os.path.join(os.path.expanduser("~"), ".claude.json"),
+    ]
+    bridge_url = f"http://localhost:{port}"
+
+    for path in settings_paths:
+        if not os.path.exists(os.path.dirname(path)):
+            continue
+
+        settings = {}
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    settings = json.load(f)
+            except Exception:
+                settings = {}
+
+        mcp_servers = settings.get("mcpServers", {})
+        already = any(
+            cfg.get("url") == bridge_url for cfg in mcp_servers.values()
+            if isinstance(cfg, dict)
+        )
+        if already:
+            print(f"  ✓ Claude Code already connected.\n")
+            return
+
+        # Add the bridge
+        mcp_servers["fac-bridge"] = {"type": "http", "url": bridge_url}
+        settings["mcpServers"] = mcp_servers
+
+        try:
+            with open(path, "w") as f:
+                json.dump(settings, f, indent=2)
+            print(f"  ✓ Auto-registered in Claude Code ({os.path.basename(path)})")
+            print(f"  → Start a new Claude Code session to use FAC tools.\n")
+            return
+        except Exception:
+            continue
+
+    print(f"  ⚠ Could not auto-register. Add manually: {{'mcpServers': {{'fac-bridge': {{'type':'http','url':'{bridge_url}'}}}}}}\n")
 
 
 # ---------------------------------------------------------------------------
