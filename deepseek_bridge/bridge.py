@@ -39,8 +39,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse, parse_qs
 
-# Force-quit on Ctrl+C — works regardless of what state the bridge is in
-signal.signal(signal.SIGINT, lambda sig, frame: os._exit(0))
+# Track interrupt state for graceful Ctrl+C handling
+_INTERRUPTED = False
+_ORIGINAL_SIGINT = signal.getsignal(signal.SIGINT)
+
+def _handle_interrupt(sig, frame):
+    global _INTERRUPTED
+    _INTERRUPTED = True
+    print("\n  [yellow]Interrupted — returning to prompt...[/]")
+
+signal.signal(signal.SIGINT, _handle_interrupt)
 
 import requests
 
@@ -966,6 +974,10 @@ class DeepSeekFrappeBridge:
         self.conversation.add_user(user_input)
 
         for _round in range(MAX_TOOL_ROUNDS):
+            global _INTERRUPTED
+            if _INTERRUPTED:
+                return "(cancelled)"
+
             self.conversation.trim()
             messages = self.conversation.get_messages()
 
@@ -1052,6 +1064,9 @@ class DeepSeekFrappeBridge:
 
         # Chat loop
         while True:
+            global _INTERRUPTED
+            _INTERRUPTED = False
+
             # Show queue status if items are pending
             with self._queue_lock:
                 pending = len(self._message_queue)
@@ -1081,13 +1096,13 @@ class DeepSeekFrappeBridge:
                 with self._queue_lock:
                     self._message_queue.append(queued_msg)
                 _print(f"  [dim]Queued ({len(self._message_queue)} pending)[/]")
-                # Start processing if not already running
                 if not self._processing:
                     self._processing = True
                     threading.Thread(target=self._process_queue, daemon=True).start()
                 continue
 
-            # Process message inline (blocks until done)
+            # Process message inline
+            _INTERRUPTED = False
             self._process_one(user_input)
 
     # ------------------------------------------------------------------
@@ -1105,19 +1120,24 @@ class DeepSeekFrappeBridge:
 
     def _process_one(self, user_input: str) -> None:
         """Process a single message and display the response."""
+        global _INTERRUPTED
         try:
             if HAS_RICH and console is not None:
-                with console.status("[dim]Thinking…[/]", spinner="dots"):
+                with console.status("[dim]Thinking… (Ctrl+C to cancel)[/]", spinner="dots"):
                     response = self.process_message(user_input)
             else:
-                print("Thinking…", end="\r")
+                print("Thinking… (Ctrl+C to cancel)", end="\r")
                 response = self.process_message(user_input)
-                print(" " * 20, end="\r")
-        except RuntimeError as exc:
+                print(" " * 30, end="\r")
+        except (RuntimeError, Exception) as exc:
+            if _INTERRUPTED:
+                _print("\n  [dim]Cancelled.[/]")
+                return
             _print(f"\n[red]✗ Error:[/] {exc}")
             return
-        except Exception as exc:
-            _print(f"\n[red]✗ Unexpected error:[/] {exc}")
+
+        if _INTERRUPTED:
+            _print("\n  [dim]Cancelled.[/]")
             return
 
         # Display response
@@ -1133,7 +1153,7 @@ class DeepSeekFrappeBridge:
 
         if cmd in ("/exit", "/quit"):
             _print("[dim]Goodbye![/]")
-            os._exit(0)
+            sys.exit(0)
 
         elif cmd == "/help":
             _markdown(
