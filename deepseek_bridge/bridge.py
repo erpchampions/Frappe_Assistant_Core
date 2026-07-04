@@ -609,17 +609,19 @@ def main(argv: Optional[List[str]] = None) -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
-              python bridge.py serve              # serve all saved sites on :9090
-              python bridge.py serve v15upgrade   # serve specific sites
-              python bridge.py --add              # add a new site
-              python bridge.py --list             # list saved sites
-              python bridge.py --remove           # remove a site
+              python bridge.py serve -u https://v15upgrade.jh.frappe.cloud/api/method/.../handle_mcp
+              python bridge.py serve                  # serve all saved sites
+              python bridge.py serve v15upgrade       # serve specific sites
+              python bridge.py --add                  # add site with API key
+              python bridge.py --list                 # list saved sites
+              python bridge.py --remove               # remove a site
         """),
     )
     sub = parser.add_subparsers(dest="command")
 
     serve_parser = sub.add_parser("serve", help="Start MCP proxy server")
-    serve_parser.add_argument("sites", nargs="*", help="Sites to serve (default: all)")
+    serve_parser.add_argument("sites", nargs="*", help="Sites to serve (default: all saved)")
+    serve_parser.add_argument("--url", "-u", help="FAC endpoint URL — auto-saves and connects (OAuth if first time)")
     serve_parser.add_argument("--port", "-p", type=int, default=DEFAULT_PORT, help=f"Port (default: {DEFAULT_PORT})")
 
     parser.add_argument("--add", action="store_true", help="Add a new FAC site interactively")
@@ -657,7 +659,36 @@ def main(argv: Optional[List[str]] = None) -> None:
         return
 
     if args.command == "serve":
-        bridge = MCPServerBridge(port=args.port, sites=args.sites or None)
+        if args.url:
+            # Check if already saved by URL match
+            existing_name = None
+            for name, cfg in mgr.list_sites().items():
+                if cfg.get("url", "").rstrip("/") == args.url.rstrip("/"):
+                    existing_name = name
+                    break
+            if existing_name:
+                print(f"  Site '{existing_name}' already saved. Connecting…")
+                sites = [existing_name]
+            else:
+                # New site — run OAuth flow to save it
+                name = SiteManager.suggest_name(args.url)
+                print(f"\n  New FAC site detected: [bold]{urlparse(args.url).hostname}[/]")
+                print(f"  Opening browser for one-time authorization…\n")
+                try:
+                    oauth_data = OAuthFlow.authorize(args.url)
+                    mgr.add(name, {"url": args.url, "api_key": "", "api_secret": "", **oauth_data})
+                    print(f"\n  ✓ Site saved as \"{name}\"")
+                    sites = [name]
+                except Exception as e:
+                    print(f"\n  ✗ OAuth failed: {e}")
+                    print("  Try API key auth instead: python bridge.py --add")
+                    sys.exit(1)
+            # Merge with any positional sites
+            all_sites = list(set(sites + (args.sites or [])))
+        else:
+            all_sites = args.sites or None
+
+        bridge = MCPServerBridge(port=args.port, sites=all_sites)
         bridge.start()
         return
 
