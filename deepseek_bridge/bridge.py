@@ -27,13 +27,20 @@ import json
 import os
 import readline  # noqa: F401 — enables line-editing and history in input()
 import secrets
+import signal
 import socket
+import subprocess
 import sys
 import textwrap
+import threading
 import time
 import webbrowser
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse, parse_qs
+
+# Force-quit on Ctrl+C — works regardless of what state the bridge is in
+signal.signal(signal.SIGINT, lambda sig, frame: os._exit(0))
 
 import requests
 
@@ -729,6 +736,169 @@ class Conversation:
 # ---------------------------------------------------------------------------
 # Bridge orchestrator
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Local machine tools — always available alongside FAC tools
+# ---------------------------------------------------------------------------
+class LocalTools:
+    """Built-in tools that run on the local machine, not via MCP."""
+
+    TOOLS: List[Dict[str, Any]] = [
+        {
+            "name": "run_shell_command",
+            "description": "Run a shell command on the local machine. Use for file operations, git, "
+            "grep, find, or any CLI tool. Commands run in the current working directory. "
+            "30-second timeout. Avoid sudo or destructive commands.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command to execute."},
+                    "cwd": {"type": "string", "description": "Working directory. Defaults to current."},
+                },
+                "required": ["command"],
+            },
+        },
+        {
+            "name": "read_local_file",
+            "description": "Read the contents of a file on the local filesystem.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file to read."},
+                    "max_lines": {"type": "integer", "default": 500, "description": "Max lines to return."},
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "write_local_file",
+            "description": "Write content to a file on the local filesystem. Only writes within "
+            "the current working directory tree for safety.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to write to."},
+                    "content": {"type": "string", "description": "Content to write."},
+                },
+                "required": ["path", "content"],
+            },
+        },
+        {
+            "name": "list_local_files",
+            "description": "List files and directories in a local path.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path. Defaults to current directory."},
+                    "pattern": {"type": "string", "description": "Optional glob pattern, e.g. '*.py'."},
+                },
+                "required": [],
+            },
+        },
+    ]
+
+    @staticmethod
+    def execute(tool_name: str, arguments: Dict[str, Any]) -> str:
+        """Execute a local tool. Returns result string."""
+        if tool_name == "run_shell_command":
+            return LocalTools._run_shell(arguments)
+        elif tool_name == "read_local_file":
+            return LocalTools._read_file(arguments)
+        elif tool_name == "write_local_file":
+            return LocalTools._write_file(arguments)
+        elif tool_name == "list_local_files":
+            return LocalTools._list_files(arguments)
+        return json.dumps({"error": f"Unknown local tool: {tool_name}"})
+
+    @staticmethod
+    def _run_shell(args: Dict[str, Any]) -> str:
+        cmd = args.get("command", "")
+        cwd = args.get("cwd") or os.getcwd()
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                timeout=30, cwd=cwd, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+            out = result.stdout
+            if result.stderr:
+                out += "\n[stderr]\n" + result.stderr
+            if result.returncode != 0:
+                out += f"\n[exit code: {result.returncode}]"
+            return out[:8000] if out else "(no output)"
+        except subprocess.TimeoutExpired:
+            return "Error: Command timed out (30s limit)."
+        except Exception as e:
+            return f"Error: {e}"
+
+    @staticmethod
+    def _read_file(args: Dict[str, Any]) -> str:
+        path = args.get("path", "")
+        max_lines = args.get("max_lines", 500)
+        try:
+            p = Path(path).expanduser().resolve()
+            content = p.read_text()
+            lines = content.split("\n")
+            if len(lines) > max_lines:
+                lines = lines[:max_lines]
+                lines.append(f"... (truncated, {len(content.split(chr(10)))} total lines)")
+            return "\n".join(lines)
+        except FileNotFoundError:
+            return f"Error: File not found: {path}"
+        except Exception as e:
+            return f"Error reading file: {e}"
+
+    @staticmethod
+    def _write_file(args: Dict[str, Any]) -> str:
+        path = args.get("path", "")
+        content = args.get("content", "")
+        try:
+            p = Path(path).expanduser().resolve()
+            # Safety: only write within CWD
+            cwd = Path(os.getcwd()).resolve()
+            if cwd not in p.parents and p != cwd and p.parent != cwd:
+                return f"Error: Can only write within {cwd}. Requested: {p}"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+            return f"Wrote {len(content)} bytes to {p}"
+        except Exception as e:
+            return f"Error writing file: {e}"
+
+    @staticmethod
+    def _list_files(args: Dict[str, Any]) -> str:
+        path = args.get("path") or os.getcwd()
+        pattern = args.get("pattern") or "*"
+        try:
+            p = Path(path).expanduser().resolve()
+            matches = list(p.glob(pattern))[:200]
+            lines = []
+            for m in sorted(matches, key=lambda x: (not x.is_dir(), x.name.lower())):
+                suffix = "/" if m.is_dir() else ""
+                size = ""
+                if m.is_file():
+                    try:
+                        size = f" ({m.stat().st_size:,} bytes)"
+                    except Exception:
+                        pass
+                lines.append(f"  {m.relative_to(p)}{suffix}{size}")
+            return f"{len(matches)} items in {p}:\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Error listing files: {e}"
+
+
+def _local_tools_as_openai() -> List[Dict[str, Any]]:
+    """Convert local tools to OpenAI/DeepSeek function format."""
+    result = []
+    for t in LocalTools.TOOLS:
+        schema = t.get("inputSchema", {})
+        params = {"type": schema.get("type", "object"), "properties": schema.get("properties", {})}
+        if "required" in schema:
+            params["required"] = schema["required"]
+        result.append({
+            "type": "function",
+            "function": {"name": t["name"], "description": t["description"], "parameters": params},
+        })
+    return result
+
+
 class DeepSeekFrappeBridge:
     """Orchestrates the DeepSeek ↔ Frappe MCP bridge conversation loop."""
 
@@ -744,6 +914,7 @@ class DeepSeekFrappeBridge:
         on_token_refresh: Any = None,
     ) -> None:
         self.verbose = verbose
+        self.mcp_url = mcp_url
         self.mcp = MCPClient(
             url=mcp_url,
             api_key=api_key,
@@ -755,6 +926,9 @@ class DeepSeekFrappeBridge:
         self.conversation: Optional[Conversation] = None
         self.tools_openai: List[Dict[str, Any]] = []
         self.tool_names: List[str] = []
+        self._message_queue: List[str] = []
+        self._queue_lock = threading.Lock()
+        self._processing = False
 
     # ------------------------------------------------------------------
     # Setup
@@ -769,11 +943,16 @@ class DeepSeekFrappeBridge:
 
         # 2. Discover tools
         mcp_tools = self.mcp.list_tools()
-        self.tools_openai = mcp_tools_to_openai(mcp_tools)
-        self.tool_names = [t["name"] for t in mcp_tools]
+        # Merge local tools with remote FAC tools
+        local_openai = _local_tools_as_openai()
+        remote_openai = mcp_tools_to_openai(mcp_tools)
+        self.tools_openai = local_openai + remote_openai
+        self.tool_names = [t["name"] for t in LocalTools.TOOLS] + [t["name"] for t in mcp_tools]
 
-        _print(f"[green]✓[/] Discovered [bold]{len(mcp_tools)}[/] tools")
+        _print(f"[green]✓[/] Discovered [bold]{len(mcp_tools)}[/] remote + [bold]{len(LocalTools.TOOLS)}[/] local tools")
         if self.verbose:
+            for t in LocalTools.TOOLS:
+                _print(f"  • [cyan]{t['name']}[/] [dim](local)[/] — {t.get('description', '')[:60]}")
             for t in mcp_tools:
                 _print(f"  • [cyan]{t['name']}[/] — {t.get('description', '')[:80]}")
 
@@ -810,7 +989,12 @@ class DeepSeekFrappeBridge:
                 _print(f"  [dim]🔧 Calling [cyan]{fn_name}[/]…[/]")
 
                 try:
-                    result_text = self.mcp.call_tool(fn_name, fn_args)
+                    # Route to local or remote tool
+                    local_names = [t["name"] for t in LocalTools.TOOLS]
+                    if fn_name in local_names:
+                        result_text = LocalTools.execute(fn_name, fn_args)
+                    else:
+                        result_text = self.mcp.call_tool(fn_name, fn_args)
                 except Exception as exc:
                     result_text = f"Error: {exc}"
 
@@ -868,6 +1052,12 @@ class DeepSeekFrappeBridge:
 
         # Chat loop
         while True:
+            # Show queue status if items are pending
+            with self._queue_lock:
+                pending = len(self._message_queue)
+            if pending:
+                _print(f"\n[dim]({pending} queued)[/]")
+
             try:
                 user_input = _ask("\n[bold blue]You[/]")
             except (EOFError, KeyboardInterrupt):
@@ -883,25 +1073,56 @@ class DeepSeekFrappeBridge:
                 self._handle_command(user_input)
                 continue
 
-            # Process message (show status while waiting for DeepSeek)
-            try:
-                if HAS_RICH and console is not None:
-                    with console.status("[dim]Thinking…[/]", spinner="dots"):
-                        response = self.process_message(user_input)
-                else:
-                    print("Thinking…", end="\r")
-                    response = self.process_message(user_input)
-                    print(" " * 20, end="\r")  # clear the line
-            except RuntimeError as exc:
-                _print(f"\n[red]✗ Error:[/] {exc}")
-                continue
-            except Exception as exc:
-                _print(f"\n[red]✗ Unexpected error:[/] {exc}")
+            # Queue mode: `! message` — queue and continue accepting input
+            if user_input.startswith("!"):
+                queued_msg = user_input[1:].strip()
+                if not queued_msg:
+                    continue
+                with self._queue_lock:
+                    self._message_queue.append(queued_msg)
+                _print(f"  [dim]Queued ({len(self._message_queue)} pending)[/]")
+                # Start processing if not already running
+                if not self._processing:
+                    self._processing = True
+                    threading.Thread(target=self._process_queue, daemon=True).start()
                 continue
 
-            # Display response
-            _print()
-            _markdown(response)
+            # Process message inline (blocks until done)
+            self._process_one(user_input)
+
+    # ------------------------------------------------------------------
+    # Queue processing
+    # ------------------------------------------------------------------
+    def _process_queue(self) -> None:
+        """Process queued messages in background thread."""
+        while True:
+            with self._queue_lock:
+                if not self._message_queue:
+                    self._processing = False
+                    return
+                msg = self._message_queue.pop(0)
+            self._process_one(msg)
+
+    def _process_one(self, user_input: str) -> None:
+        """Process a single message and display the response."""
+        try:
+            if HAS_RICH and console is not None:
+                with console.status("[dim]Thinking…[/]", spinner="dots"):
+                    response = self.process_message(user_input)
+            else:
+                print("Thinking…", end="\r")
+                response = self.process_message(user_input)
+                print(" " * 20, end="\r")
+        except RuntimeError as exc:
+            _print(f"\n[red]✗ Error:[/] {exc}")
+            return
+        except Exception as exc:
+            _print(f"\n[red]✗ Unexpected error:[/] {exc}")
+            return
+
+        # Display response
+        _print()
+        _markdown(response)
 
     # ------------------------------------------------------------------
     # Commands
@@ -912,14 +1133,17 @@ class DeepSeekFrappeBridge:
 
         if cmd in ("/exit", "/quit"):
             _print("[dim]Goodbye![/]")
-            sys.exit(0)
+            os._exit(0)
 
         elif cmd == "/help":
             _markdown(
                 textwrap.dedent("""\
                 **Available Commands:**
-                - `/tools` — list all available MCP tools
-                - `/clear` — clear conversation history and start fresh
+                - `! message` — queue a message for background processing
+                - `/tools` — list all available tools (local + remote)
+                - `/queue` — show queued messages
+                - `/cancel` — clear the message queue
+                - `/clear` — clear conversation history
                 - `/history` — show conversation message count
                 - `/help`  — show this help
                 - `/exit`  — quit the bridge
@@ -930,9 +1154,27 @@ class DeepSeekFrappeBridge:
             if not self.tool_names:
                 _print("[dim]No tools available.[/]")
                 return
+            local_names = [t["name"] for t in LocalTools.TOOLS]
             _print(f"\n[bold]Available Tools ({len(self.tool_names)}):[/]")
             for name in self.tool_names:
-                _print(f"  • [cyan]{name}[/]")
+                tag = " [dim](local)[/]" if name in local_names else ""
+                _print(f"  • [cyan]{name}[/]{tag}")
+
+        elif cmd == "/queue":
+            with self._queue_lock:
+                pending = list(self._message_queue)
+            if not pending:
+                _print("[dim]No queued messages.[/]")
+            else:
+                _print(f"[bold]{len(pending)} queued:[/]")
+                for i, msg in enumerate(pending, 1):
+                    _print(f"  {i}. [dim]{msg[:80]}[/]")
+
+        elif cmd == "/cancel":
+            with self._queue_lock:
+                count = len(self._message_queue)
+                self._message_queue.clear()
+            _print(f"[green]✓[/] Cleared {count} queued message(s).")
 
         elif cmd == "/clear":
             if self.conversation:
