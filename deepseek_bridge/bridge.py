@@ -479,10 +479,15 @@ def _rule(title: str = "") -> None:
 
 
 def _ask(prompt: str) -> str:
-    if HAS_RICH and console is not None:
-        from rich.prompt import Prompt
-        return Prompt.ask(prompt)
-    return input(prompt + " ")
+    # Use plain input() — works best for long text and pasting
+    # Print prompt with clear visual separation
+    _print(prompt)
+    try:
+        return input("  ")
+    except KeyboardInterrupt:
+        raise
+    except EOFError:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -733,12 +738,22 @@ class Conversation:
     def get_messages(self) -> List[Dict[str, Any]]:
         return self.messages
 
-    def trim(self, max_messages: int = 50) -> None:
-        """Keep message history from growing too large."""
-        if len(self.messages) > max_messages:
-            # Always keep the system message if present
-            start = 1 if self.messages[0].get("role") == "system" else 0
-            self.messages = self.messages[:start] + self.messages[-(max_messages - start):]
+    def trim(self, max_messages: int = 80) -> None:
+        """Keep message history from growing too large. Never split tool exchanges."""
+        if len(self.messages) <= max_messages:
+            return
+        # Always keep system message
+        start = 1 if self.messages[0].get("role") == "system" else 0
+        # Trim from the front, but only at user-message boundaries
+        # This ensures tool_calls + tool results stay together
+        keep = self.messages[-max_messages:]
+        # Find the first user message in keep and cut from there
+        for i, msg in enumerate(keep):
+            if msg.get("role") == "user":
+                self.messages = self.messages[:start] + keep[i:]
+                return
+        # Fallback: no user message found, keep as-is
+        self.messages = self.messages[:start] + keep
 
 
 # ---------------------------------------------------------------------------
@@ -1074,7 +1089,7 @@ class DeepSeekFrappeBridge:
                 _print(f"\n[dim]({pending} queued)[/]")
 
             try:
-                user_input = _ask("\n[bold blue]You[/]")
+                user_input = _ask("\n[bold blue]▸ You[/]")
             except (EOFError, KeyboardInterrupt):
                 _print("\n[dim]Goodbye![/]")
                 break
