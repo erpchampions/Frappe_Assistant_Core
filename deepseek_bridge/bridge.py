@@ -914,8 +914,9 @@ class LocalTools:
         },
         {
             "name": "list_bridge_sessions",
-            "description": "List saved bridge conversation sessions. Use this when the user asks about "
-            "sessions, saved conversations, or bridge history. Returns session names, message counts, and timestamps.",
+            "description": "List saved bridge conversation sessions AND current connection info (site name, URL). "
+            "Use this when the user asks about sessions, saved conversations, bridge history, or which site/URL "
+            "they are connected to.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -1127,18 +1128,21 @@ class DeepSeekFrappeBridge:
             self.conversation.add_assistant(text, tool_calls)
 
             # Detect infinite loops: same tool 3+ consecutive times
-            tool_names = [tc["function"]["name"] for tc in tool_calls]
-            if tool_names and all(n == tool_names[0] for n in tool_names):
-                if tool_names[0] == last_tool:
+            tool_names_list = [tc["function"]["name"] for tc in tool_calls]
+            if tool_names_list and all(n == tool_names_list[0] for n in tool_names_list):
+                if tool_names_list[0] == last_tool:
                     same_tool_count += 1
                     if same_tool_count >= 3:
+                        # Don't add the tool_calls message — just return the break message
                         return (
-                            f"I called {tool_names[0]} {same_tool_count} times in a row without success. "
+                            f"I called {tool_names_list[0]} {same_tool_count} times without progress. "
                             "Let me try a different approach or ask the user for guidance."
                         )
                 else:
-                    last_tool = tool_names[0]
+                    last_tool = tool_names_list[0]
                     same_tool_count = 1
+
+            self.conversation.add_assistant(text, tool_calls)
 
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]
@@ -1230,6 +1234,9 @@ class DeepSeekFrappeBridge:
             if user_input.startswith("/"):
                 self._handle_command(user_input)
                 continue
+            if user_input.lower() in ("exit", "quit"):
+                _print("[dim]Goodbye![/] (use /exit next time)")
+                sys.exit(0)
 
             # Queue mode: `! message` — queue and continue accepting input
             if user_input.startswith("!"):
@@ -1289,9 +1296,12 @@ class DeepSeekFrappeBridge:
             SessionStore.save(self.site_name, self.conversation.messages)
 
     def _build_system_prompt(self, mcp_tools: list) -> str:
+        site_info = ""
+        if self.site_name:
+            site_info = f"You are connected to FAC site \"{self.site_name}\" at {self.mcp_url}.\n"
         return textwrap.dedent(f"""\
-            You are a helpful ERPNext assistant powered by DeepSeek. You have access to
-            {len(LocalTools.TOOLS)} local tools and {len(mcp_tools)} ERPNext tools.
+            You are a helpful ERPNext assistant powered by DeepSeek.
+            {site_info}You have access to {len(LocalTools.TOOLS)} local tools and {len(mcp_tools)} ERPNext tools.
 
             Remote tools: {', '.join([t['name'] for t in mcp_tools][:20])}
             Local tools: {', '.join([t['name'] for t in LocalTools.TOOLS])}
