@@ -80,6 +80,7 @@ MAX_TOOL_ROUNDS = 25  # prevent infinite tool-calling loops
 MCP_PROTOCOL_VERSION = "2025-06-18"
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".fac_bridge")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "sites.json")
+SESSION_DIR = os.path.join(CONFIG_DIR, "sessions")
 OAUTH_TIMEOUT = 120  # seconds to wait for browser login
 
 
@@ -760,6 +761,66 @@ class Conversation:
 # Bridge orchestrator
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+# Session persistence — save/restore conversation history
+# ---------------------------------------------------------------------------
+class SessionStore:
+    """Persists conversation history to ~/.fac_bridge/sessions/<name>.json."""
+
+    @staticmethod
+    def _path(site_name: str) -> str:
+        return os.path.join(SESSION_DIR, f"{site_name}.json")
+
+    @staticmethod
+    def save(site_name: str, messages: List[Dict[str, Any]]) -> None:
+        os.makedirs(SESSION_DIR, exist_ok=True)
+        data = {
+            "site": site_name,
+            "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "message_count": len(messages),
+            "messages": messages,
+        }
+        with open(SessionStore._path(site_name), "w") as f:
+            json.dump(data, f, indent=2)
+
+    @staticmethod
+    def load(site_name: str) -> Optional[List[Dict[str, Any]]]:
+        path = SessionStore._path(site_name)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            return data.get("messages", [])
+        except Exception:
+            return None
+
+    @staticmethod
+    def delete(site_name: str) -> None:
+        path = SessionStore._path(site_name)
+        if os.path.exists(path):
+            os.remove(path)
+
+    @staticmethod
+    def list_sessions() -> List[Dict[str, Any]]:
+        result = []
+        if not os.path.exists(SESSION_DIR):
+            return result
+        for f in sorted(os.listdir(SESSION_DIR), reverse=True):
+            if f.endswith(".json"):
+                try:
+                    with open(os.path.join(SESSION_DIR, f)) as fp:
+                        data = json.load(fp)
+                    result.append({
+                        "name": f[:-5],
+                        "updated": data.get("updated", "?"),
+                        "messages": data.get("message_count", 0),
+                    })
+                except Exception:
+                    pass
+        return result
+
+
+# ---------------------------------------------------------------------------
 # Local machine tools — always available alongside FAC tools
 # ---------------------------------------------------------------------------
 class LocalTools:
@@ -935,9 +996,13 @@ class DeepSeekFrappeBridge:
         model: str = DEEPSEEK_MODEL,
         verbose: bool = False,
         on_token_refresh: Any = None,
+        site_name: str = "",
+        fresh: bool = False,
     ) -> None:
         self.verbose = verbose
         self.mcp_url = mcp_url
+        self.site_name = site_name
+        self.fresh = fresh
         self.mcp = MCPClient(
             url=mcp_url,
             api_key=api_key,
@@ -1048,34 +1113,31 @@ class DeepSeekFrappeBridge:
         if not mcp_tools:
             _print("\n[yellow]⚠ No tools discovered. The assistant can chat but cannot access ERPNext data.[/]")
 
-        # Build system prompt
-        system_prompt = textwrap.dedent(f"""\
-            You are a helpful ERPNext assistant powered by DeepSeek. You have access to
-            {len(mcp_tools)} tools that let you interact with the ERPNext system.
+        # Try to resume previous session
+        if not self.fresh and self.site_name:
+            saved = SessionStore.load(self.site_name)
+            if saved:
+                self.conversation = Conversation()
+                self.conversation.messages = saved
+                _print(f"[dim]↻ Resumed session ({len(saved)} messages)[/]")
+            else:
+                self.conversation = Conversation(self._build_system_prompt(mcp_tools))
+        else:
+            self.conversation = Conversation(self._build_system_prompt(mcp_tools))
 
-            Available tools: {', '.join(self.tool_names[:20])}
-            {"… and more" if len(self.tool_names) > 20 else ""}
-
-            Guidelines:
-            - Use the tools to look up, create, or update information in ERPNext.
-            - When searching, be specific with doctype names (e.g., "Customer", "Sales Invoice").
-            - Always confirm when creating or modifying records.
-            - If a tool returns an error, explain the issue to the user and suggest a fix.
-            - Format your responses clearly using markdown.
-            - If you don't have a tool for something, tell the user what you'd need.
-        """)
-
-        self.conversation = Conversation(system_prompt)
-
-        # Print welcome banner
+        # Welcome
         _rule("DeepSeek + Frappe Assistant Core")
         _markdown(
-            f"Connected to [bold]{self.mcp.url}[/] with [bold]{len(mcp_tools)} tools[/].\n"
+            f"Connected to [bold]{self.mcp.url}[/] with [bold]{len(mcp_tools)} remote + {len(LocalTools.TOOLS)} local tools[/].\n"
             f"Model: [bold]{self.chat.model}[/]\n"
-            "Type [bold]/help[/] for commands, [bold]/exit[/] to quit.\n"
-            "Your data stays on your Frappe server — only chat messages go to DeepSeek."
+            "Type [bold]/help[/] for commands, [bold]/exit[/] to quit."
         )
         _rule()
+
+        def _auto_save():
+            """Save session after each exchange."""
+            if self.site_name and self.conversation:
+                SessionStore.save(self.site_name, self.conversation.messages)
 
         # Chat loop
         while True:
@@ -1155,9 +1217,27 @@ class DeepSeekFrappeBridge:
             _print("\n  [dim]Cancelled.[/]")
             return
 
-        # Display response
+        # Display response and auto-save
         _print()
         _markdown(response)
+        if self.site_name and self.conversation:
+            SessionStore.save(self.site_name, self.conversation.messages)
+
+    def _build_system_prompt(self, mcp_tools: list) -> str:
+        return textwrap.dedent(f"""\
+            You are a helpful ERPNext assistant powered by DeepSeek. You have access to
+            {len(LocalTools.TOOLS)} local tools and {len(mcp_tools)} ERPNext tools.
+
+            Remote tools: {', '.join([t['name'] for t in mcp_tools][:20])}
+            Local tools: {', '.join([t['name'] for t in LocalTools.TOOLS])}
+
+            Guidelines:
+            - Use tools to look up, create, or update information in ERPNext.
+            - Use local tools for file operations and shell commands.
+            - Be specific with doctype names (e.g., "Customer", "Sales Invoice").
+            - Always confirm when creating or modifying records.
+            - Format responses clearly using markdown.
+        """)
 
     # ------------------------------------------------------------------
     # Commands
@@ -1179,6 +1259,9 @@ class DeepSeekFrappeBridge:
                 - `/queue` — show queued messages
                 - `/cancel` — clear the message queue
                 - `/clear` — clear conversation history
+                - `/save` — explicitly save current session
+                - `/reset` — clear history + delete saved session
+                - `/sessions` — list saved sessions
                 - `/history` — show conversation message count
                 - `/help`  — show this help
                 - `/exit`  — quit the bridge
@@ -1218,6 +1301,33 @@ class DeepSeekFrappeBridge:
                     system_prompt=sys_msg["content"] if sys_msg and sys_msg.get("role") == "system" else None
                 )
             _print("[green]✓[/] Conversation history cleared.")
+
+        elif cmd == "/save":
+            if self.site_name and self.conversation:
+                SessionStore.save(self.site_name, self.conversation.messages)
+                count = len(self.conversation.messages)
+                _print(f"[green]✓[/] Session saved ({count} messages)")
+            else:
+                _print("[dim]No session to save.[/]")
+
+        elif cmd == "/reset":
+            if self.conversation:
+                sys_msg = self.conversation.messages[0] if self.conversation.messages else None
+                self.conversation = Conversation(
+                    system_prompt=sys_msg["content"] if sys_msg and sys_msg.get("role") == "system" else None
+                )
+            if self.site_name:
+                SessionStore.delete(self.site_name)
+            _print("[green]✓[/] Session reset — history cleared and saved session deleted.")
+
+        elif cmd == "/sessions":
+            sessions = SessionStore.list_sessions()
+            if not sessions:
+                _print("[dim]No saved sessions.[/]")
+            else:
+                _print(f"\n[bold]Saved Sessions ({len(sessions)}):[/]")
+                for s in sessions:
+                    _print(f"  [cyan]{s['name']:<20}[/] {s['messages']} msgs — {s['updated']}")
 
         elif cmd == "/history":
             count = len(self.conversation.messages) if self.conversation else 0
@@ -1296,6 +1406,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Show detailed tool discovery and debug info",
+    )
+    parser.add_argument(
+        "--fresh", action="store_true", help="Start fresh (ignore saved session)"
     )
 
     args = parser.parse_args(argv)
@@ -1428,6 +1541,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         model=args.model,
         verbose=args.verbose,
         on_token_refresh=on_token_refresh,
+        site_name=site_name_for_refresh,
+        fresh=args.fresh,
     )
     bridge.run()
 
